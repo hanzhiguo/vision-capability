@@ -38,25 +38,22 @@ Key 在 GRSAI 控制台获取（测试页 Global Configuration 里的 API Key �
 脚本：`scripts/vision.py`（仅用 Python 标准库，无需安装依赖）。
 
 ```bash
-# OCR 识别图片文字（默认模式）
+# ★★★ 视觉理解智能体（默认 / 唯一模式）：先分类图片类型，再按类型走专项策略，
+#     输出固定 JSON Schema（image_type/layout/elements/text_content/style_analysis/
+#     spatial_relationships/reconstruction_hint/confidence），供下游非视觉模型做
+#     图片理解 / UI复刻 / HTML生成 / 设计分析。
 python scripts/vision.py 图片.png
 
 # 多张图片一起识别
 python scripts/vision.py a.png b.jpg "https://example.com/c.png"
 
-# 描述图片内容
-python scripts/vision.py 图片.png --mode describe
-
-# ★ 详细感知报告：面向非视觉模型，输出足以"脑补出图"的结构化文本
-python scripts/vision.py 图片.png --mode perceive
-
-# 把图片信息抽成 JSON（自动推断字段）
-python scripts/vision.py 表格.png --mode extract
+# 直接把结果写成 JSON 文件
+python scripts/vision.py 图片.png --output result.json
 
 # ★ 领域无关提取：传任意字段名，返回 JSON（无需预定义类目）
 python scripts/vision.py 产品.png --keys 名称,材质,价格,规格
 
-# 结果直接写 JSON 文件（方便下游拼表/再处理）
+# 结果直接写 JSON 文件
 python scripts/vision.py 产品.png --keys 名称,价格 --output result.json
 
 # 自定义提示词 + 指定模型
@@ -70,16 +67,19 @@ python scripts/vision.py 图.png --json
 python scripts/vision.py 产品.png --keys 名称 --dry-run
 ```
 
-### 模式选择速查
-| 模式 | 输出 | 适用下游 |
-|------|------|----------|
-| `ocr` | 图中全部文字 | 需要精确引用文字 |
-| `describe` | 一句话/段落描述 | 一句话画像 |
-| `extract` | JSON（自动推断字段） | 要结构化但字段不固定 |
-| `perceive` | 详尽 Markdown 报告（概述/OCR/对象/布局/颜色/数据/需核验） | 非视觉模型理解整图并推理 |
-| `--keys` | JSON（指定字段） | 领域无关、按需取字段 |
+### 参数速查
+| 参数 | 说明 |
+|------|------|
+| 无参数（默认） | 视觉理解智能体：输出固定 JSON Schema（image_type/layout/elements/text_content/style_analysis/spatial_relationships/reconstruction_hint/confidence）|
+| `--keys` | 领域无关提取：逗号分隔的字段名，如 `--keys 名称,材质,价格`（返回 JSON）|
+| `--function` | 调用 functions.json 里自定义的功能（需自建）|
+| `--prompt` | 覆盖默认提示词 |
+| `--output` | 将 JSON 结果写入文件 |
+| `--per-image` | 多图时每张单独请求，结果聚合为 JSON 数组 |
+| `--json` | 输出原始 API 响应 |
+| `--dry-run` | 只构造请求 payload，不发起网络请求 |
 
-> 不确定信息一律标注 `（核验）`，交给下游模型或人确认；图片没有的字段填 `null`（不虚构）。
+> 不确定信息会在 JSON 中体现；图片没有的字段填 `null`（不虚构）。
 
 ## 作为 MCP 工具使用（可选）
 `scripts/mcp_server.py` 是一个最小可用的 MCP stdio 服务，把本能力暴露成工具

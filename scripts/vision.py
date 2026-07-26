@@ -40,34 +40,207 @@ SUPPORTED_EXT = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".tif", ".tiff"
 }
 
-# 不同模式下的默认提示词（用户可用 --prompt 覆盖）
-DEFAULT_PROMPTS = {
-    "ocr": (
-        "请识别并转录图片中的所有文字，保持原始排版与阅读顺序。"
-        "如果是表格，请保留行列结构；只输出识别到的文字内容，不要额外解释。"
-    ),
-    "describe": (
-        "请详细描述这张图片的内容：主体、场景、文字、颜色、人物或物体，"
-        "以及任何值得注意的细节。"
-    ),
-    "extract": (
-        "请从图片中提取结构化信息，并以 JSON 格式返回（字段名->值）。"
-        "若包含表格，请逐行提取为数组。只返回 JSON，不要多余解释。"
-    ),
-    "perceive": (
-        "你是一个为「无法看图的语言模型」服务的视觉转述器。"
-        "请极其详尽地把这张图片的内容转化为纯文本，使其足以让一个只会读文字的模型"
-        "完整理解图片的一切关键信息。请严格按以下 Markdown 小节输出，不要遗漏任何文字、"
-        "数字或符号，也不要额外寒暄：\n\n"
-        "## 概述\n一句话说明图片是什么（类型：截图/商品图/表格/文档/照片/图表…；主要主题）。\n\n"
-        "## 文字内容（OCR）\n逐行转录图中所有可见文字，保持原顺序与排版；表格请保留行列结构。\n\n"
-        "## 主体与对象\n列出图中的主要对象/人物/元素，及其可观察属性（数量、形状、大小、状态、材质）。\n\n"
-        "## 布局与空间关系\n描述各元素的位置与相互关系（上/下/左/右/包含/并列/对齐）。\n\n"
-        "## 颜色与风格\n整体色调、配色、字体风格、设计风格、画质。\n\n"
-        "## 数据/图表（如有）\n若含图表、曲线、数值，说明其含义、坐标轴、关键数据点、趋势与异常。\n\n"
-        "## 值得注意的细节\n任何异常、模糊、需核验、或容易被忽略但重要的信息，标注（核验）。"
-    ),
+AGENT_PROMPT = r"""你是一名专业的「视觉理解与结构化分析智能体（Vision Understanding Agent）」。
+
+你的任务：
+分析用户上传的图片，并将图片中的视觉信息转换为结构化数据。
+
+你的输出不是给人看的图片描述，而是给另一个文本大语言模型使用的视觉知识。
+文本模型无法直接看到图片，它只能依赖你的分析结果进行：
+- 图片理解
+- 内容生成
+- UI复刻
+- HTML/CSS生成
+- 设计分析
+- 产品营销分析
+- 图片生成提示词设计
+- 知识库检索
+
+========================
+核心分析原则
+========================
+
+1. 先判断图片类型
+
+必须从以下类型选择：
+- pure_text: 纯文字、截图、文档、说明书、PDF页面
+- ui_design: 网站、APP、后台系统、软件界面截图
+- poster: 海报、电商详情页、广告图、营销图片
+- product: 产品摄影、商品图片、工业设计图片
+- scene: 场景照片、环境图片
+- diagram: 流程图、结构图、技术图
+- unknown: 无法判断
+
+
+2. 不要只描述"看到了什么"
+
+需要回答：
+- 图片由哪些元素组成？
+- 元素在哪里？
+- 元素之间是什么关系？
+- 使用了什么设计规律？
+- 如何复现这个图片？
+
+
+3. 禁止幻觉
+
+如果无法确认：使用 "unknown" 或者 "无法确认"
+不要编造：品牌、产品型号、人物身份、隐藏文字
+
+
+========================
+分析维度
+========================
+
+
+一、基础信息
+分析：图片类型、图片主题、使用场景、视觉目的
+
+二、视觉布局
+分析：整体构图、上中下结构、左右结构、主视觉位置、阅读顺序
+
+三、元素识别
+识别：图片元素、文本元素、UI组件、图标、装饰元素、背景
+每个元素包含：名称、类型、位置、尺寸比例、视觉作用
+
+四、文字分析
+识别图片中的所有文字。包括：原始文本、标题、副标题、标签、按钮文字
+分析：字体大小、粗细、对齐方式、颜色、层级
+
+五、视觉风格
+分析：色彩体系、光影、材质、风格关键词
+例如：minimal, luxury, technology, industrial, modern, premium
+
+六、空间关系
+描述元素之间的位置关系。例如：product: center, title: above product, button: bottom-right
+
+
+========================
+不同图片类型专项分析
+========================
+
+
+
+如果 image_type = pure_text
+
+
+重点输出：
+- OCR文本
+- 标题层级
+- 段落结构
+- 表格结构
+- 文档布局
+
+用于：OCR、翻译、重新排版
+
+
+
+------------------------
+
+
+如果 image_type = ui_design
+
+
+重点分析：
+
+页面结构：Header, Hero, Sidebar, Content Area, Footer
+组件：Button, Card, Input, Navigation, Modal
+输出：组件名称、尺寸、间距、圆角、阴影、颜色
+
+目标：可以根据结果重新生成 HTML / React / Vue / CSS
+
+
+
+------------------------
+
+
+如果 image_type = poster
+
+
+重点分析：
+
+广告结构：主标题、产品主体、卖点、CTA按钮、装饰元素
+分析：营销逻辑、视觉焦点、情绪表达、摄影风格
+
+目标：可以生成类似海报。
+
+
+
+------------------------
+
+
+如果 image_type = product
+
+
+重点分析：
+产品：外观、材质、结构、颜色、关键零件
+摄影：镜头角度、景别、光线、背景、景深
+
+目标：用于产品建模、AI生成、商品详情页
+
+
+
+========================
+输出格式
+========================
+
+
+必须返回 JSON。格式：
+
+{
+  "image_type": "",
+  "summary": "",
+  "visual_purpose": "",
+  "layout": {
+    "structure": "",
+    "reading_order": [],
+    "main_focus": ""
+  },
+  "elements": [
+    {
+      "name": "",
+      "type": "",
+      "description": "",
+      "position": "",
+      "importance": ""
+    }
+  ],
+  "text_content": [
+    {
+      "text": "",
+      "role": "",
+      "style": ""
+    }
+  ],
+  "style_analysis": {
+    "visual_style": "",
+    "colors": [],
+    "lighting": "",
+    "material": ""
+  },
+  "spatial_relationships": [
+    {
+      "object1": "",
+      "object2": "",
+      "relationship": ""
+    }
+  ],
+  "reconstruction_hint": "",
+  "ai_generation_keywords": [],
+  "confidence": 0
 }
+
+
+========================
+最终目标
+========================
+
+你的输出应该让一个没有看到图片的文本模型，像"看过图片一样"理解图片。
+优先提供：结构信息 > 视觉关系 > 设计规律 > 文字内容 > 主观评价。
+不要写散文式描述。输出必须结构化、准确、可计算。"""
+
+# 不同模式下的默认提示词（用户可用 --prompt 覆盖）
+DEFAULT_PROMPTS = {"agent": AGENT_PROMPT}
 
 
 # ----------------------------------------------------------------------------
@@ -107,6 +280,25 @@ def load_base_url():
         or os.environ.get("GRSAI_BASE_URL")
         or DEFAULT_BASE_URL
     ).rstrip("/")
+
+
+def load_agent_prompt(override=None):
+    """视觉理解智能体（agent 模式）的提示词。
+
+    优先级：用户 --prompt 覆盖 > 同目录 agent_prompt.txt > 内置 AGENT_PROMPT 默认。
+    """
+    if override:
+        return override
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_prompt.txt")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt
+        except OSError:
+            pass
+    return AGENT_PROMPT
 
 
 # ----------------------------------------------------------------------------
@@ -291,10 +483,9 @@ def main():
     ap.add_argument("--prompt", help="自定义提示词（覆盖模式默认提示）")
     ap.add_argument(
         "--mode",
-        choices=["ocr", "describe", "extract", "perceive"],
-        default="ocr",
-        help="预设模式：ocr=识别文字 / describe=描述内容 / extract=提取结构化 / "
-             "perceive=详细感知报告(面向非视觉模型)",
+        choices=["agent"],
+        default="agent",
+        help="预设模式：agent=视觉理解智能体(最终版,固定JSON Schema,唯一模式)",
     )
     ap.add_argument("--keys", help="领域无关提取：逗号分隔的字段名，如 名称,材质,价格（返回 JSON）")
     ap.add_argument(
@@ -317,7 +508,7 @@ def main():
     # 判定走哪条提取路径
     func_key = args.function
     keys = [k for k in (args.keys or "").split(",")] if args.keys else []
-    structured = bool(func_key) or bool(keys)  # 结构化输出（JSON）
+    structured = True  # agent 是唯一模式，始终结构化 JSON 输出
 
     base_url = (args.base_url or load_base_url()).rstrip("/")
 
@@ -338,6 +529,9 @@ def main():
             sys.exit(2)
         prompt = args.prompt or build_keys_prompt(keys, extra=args.hint or "")
         system = args.system if args.system else "你只输出 JSON 数据，不输出任何解释性文字。"
+    elif args.mode == "agent":
+        prompt = load_agent_prompt(args.prompt)
+        system = args.system if args.system else "你只输出 JSON 数据，不输出任何解释性文字。返回的 JSON 必须严格符合指定的格式。"
     else:
         prompt = args.prompt or DEFAULT_PROMPTS[args.mode]
         system = args.system
