@@ -1,0 +1,4 @@
+# grsai 中转站凭证（复制为 config.txt 并填入你的 Key，不要提交到仓库）
+GRSAI_API_KEY=你的grsai中继Key
+# 可选：自定义中转站地址，默认 https://grsaiapi.com
+# GRSAI_CHAT_BASE_URL=https://grsaiapi.com

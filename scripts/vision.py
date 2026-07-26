@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vision-capability — 通用「视觉能力」，可独立抽取、与非视觉模型配合。
+
+通过 grsai 第三方中转站调用 Google Gemini 多模态模型，把图片转成纯文本/JSON，
+让任何不会看图的语言模型获得"眼睛"。本脚本**不含任何业务领域内容**（如商品/SKU），
+只提供通用的视觉转述能力：
+
+  - ocr      精确转录图中文字（表格保留行列）
+  - describe 自然语言描述图片内容
+  - extract  把图片信息抽成 JSON 结构（自动推断字段）
+  - perceive 为纯文本模型定制的详尽感知报告（概述/OCR/对象/布局/颜色/数据/需核验）
+  - keys     指定任意字段名做结构化提取（领域无关，例如 --keys 名称,材质,价格）
+  - function 调用 functions.json 里用户自定义的功能化提取（默认无，可自建）
+
+复用的调用链路（来自 GRSAI 中转站）：
+  - 端点:  {GRSAI_CHAT_BASE_URL}/v1/chat/completions   (OpenAI 兼容)
+  - 鉴权:  Authorization: Bearer <GRSAI_API_KEY>
+  - 模型:  gemini-3-flash (默认) / gemini-3-pro
+  - 图片:  以 OpenAI 视觉消息格式 image_url 传入（本地图自动 base64 成 data URL）
+
+仅依赖 Python 标准库，无需 pip install。凭证只从环境变量或本地 config 读取，不外泄。
+"""
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE_URL = "https://grsaiapi.com"
+DEFAULT_MODEL = "gemini-3-flash"
+
+SUPPORTED_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".tif", ".tiff"
+}
+
+# 不同模式下的默认提示词（用户可用 --prompt 覆盖）
+DEFAULT_PROMPTS = {
+    "ocr": (
+        "请识别并转录图片中的所有文字，保持原始排版与阅读顺序。"
+        "如果是表格，请保留行列结构；只输出识别到的文字内容，不要额外解释。"
+    ),
+    "describe": (
+        "请详细描述这张图片的内容：主体、场景、文字、颜色、人物或物体，"
+        "以及任何值得注意的细节。"
+    ),
+    "extract": (
+        "请从图片中提取结构化信息，并以 JSON 格式返回（字段名->值）。"
+        "若包含表格，请逐行提取为数组。只返回 JSON，不要多余解释。"
+    ),
+    "perceive": (
+        "你是一个为「无法看图的语言模型」服务的视觉转述器。"
+        "请极其详尽地把这张图片的内容转化为纯文本，使其足以让一个只会读文字的模型"
+        "完整理解图片的一切关键信息。请严格按以下 Markdown 小节输出，不要遗漏任何文字、"
+        "数字或符号，也不要额外寒暄：\n\n"
+        "## 概述\n一句话说明图片是什么（类型：截图/商品图/表格/文档/照片/图表…；主要主题）。\n\n"
+        "## 文字内容（OCR）\n逐行转录图中所有可见文字，保持原顺序与排版；表格请保留行列结构。\n\n"
+        "## 主体与对象\n列出图中的主要对象/人物/元素，及其可观察属性（数量、形状、大小、状态、材质）。\n\n"
+        "## 布局与空间关系\n描述各元素的位置与相互关系（上/下/左/右/包含/并列/对齐）。\n\n"
+        "## 颜色与风格\n整体色调、配色、字体风格、设计风格、画质。\n\n"
+        "## 数据/图表（如有）\n若含图表、曲线、数值，说明其含义、坐标轴、关键数据点、趋势与异常。\n\n"
+        "## 值得注意的细节\n任何异常、模糊、需核验、或容易被忽略但重要的信息，标注（核验）。"
+    ),
+}
+
+
+# ----------------------------------------------------------------------------
+# 凭证读取：环境变量优先，其次本地 config（不写日志、不回显）
+# ----------------------------------------------------------------------------
+def load_api_key():
+    key = os.environ.get("GRSAI_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt"),
+        os.path.expanduser("~/.workbuddy/skills/vision-capability/config.txt"),
+        ".grsai_key",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            if k.strip() in ("GRSAI_API_KEY", "API_KEY"):
+                                return v.strip()
+                        else:
+                            return line
+            except OSError:
+                continue
+    return None
+
+
+def load_base_url():
+    return (
+        os.environ.get("GRSAI_CHAT_BASE_URL")
+        or os.environ.get("GRSAI_BASE_URL")
+        or DEFAULT_BASE_URL
+    ).rstrip("/")
+
+
+# ----------------------------------------------------------------------------
+# 用户自定义功能（functions.json，默认空；可建任意领域功能，与脚本解耦）
+# ----------------------------------------------------------------------------
+def load_functions():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "functions.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write(f"[warn] 读取 functions.json 失败，使用空配置: {e}\n")
+    return {}
+
+
+def build_function_prompt(func, extra=""):
+    """由功能定义生成严格提取提示词（functions.json 可用 prompt 覆盖）。"""
+    if func.get("prompt"):
+        prompt = func["prompt"]
+    else:
+        fields = func.get("fields", [])
+        categories = func.get("categories") or []
+        has_struct = any(f.get("struct") for f in fields)
+        field_lines = "\n".join(f'- "{f["key"]}": {f.get("desc", "")}' for f in fields)
+        prompt = (
+            "你是一个严格的数据提取助手。请从图片中识别并提取以下字段，"
+            "仅以 JSON 对象返回，不要任何额外说明，也不要用 Markdown 代码块包裹。\n\n"
+            "字段列表（必须全部包含这些键，顺序无所谓）：\n" + field_lines
+        )
+        if has_struct:
+            prompt += (
+                "\n\n结构化字段说明：\n"
+                "- 含数组型字段时，每个元素为 {\"键\": 值} 形式。"
+            )
+        if categories:
+            cat_list = json.dumps(categories, ensure_ascii=False)
+            prompt += (
+                f"\n\n类目必须严格从以下列表中选择一个最贴切的，不得新建或改写：\n{cat_list}\n"
+                f"若无法确定，选择列表最后一个并在值后追加\"（核验）\"。"
+            )
+        prompt += (
+            "\n\n重要规则：\n"
+            "1. 不虚构：图片中确实没有的字段，值填 null（绝不用推测值填充）。\n"
+            "2. 不确定：保留最佳判断值，并在值后追加\"（核验）\"，例如 \"1:35（核验）\"。\n"
+            "3. 价格/重量/数量等只填图片明示内容，不换算或估算。\n"
+            "4. 只输出一个 JSON 对象，键名必须与上面完全一致。"
+        )
+    if extra:
+        prompt += "\n\n补充提示（务必遵守）：\n" + extra
+    return prompt
+
+
+def build_keys_prompt(keys, extra=""):
+    """领域无关的「按字段名提取」：用户传任意键列表，返回 JSON。"""
+    clean = [k.strip() for k in keys if k.strip()]
+    if not clean:
+        raise ValueError("--keys 至少需要一个字段名")
+    field_lines = "\n".join(f'- "{k}"' for k in clean)
+    prompt = (
+        "你是一个严格的数据提取助手。请从图片中识别并提取以下字段，"
+        "仅以 JSON 对象返回，不要任何额外说明，也不要用 Markdown 代码块包裹。\n\n"
+        "字段列表（必须全部包含这些键）：\n" + field_lines +
+        "\n\n重要规则：\n"
+        "1. 不虚构：图片中确实没有的字段，值填 null。\n"
+        "2. 不确定：保留最佳判断值并在其后追加\"（核验）\"。\n"
+        "3. 价格/重量/数量等只填图片明示内容，不换算估算。\n"
+        "4. 只输出一个 JSON 对象，键名必须与上面完全一致。"
+    )
+    if extra:
+        prompt += "\n\n补充提示：\n" + extra
+    return prompt
+
+
+# ----------------------------------------------------------------------------
+# 图片 -> 可发送内容
+# ----------------------------------------------------------------------------
+def image_to_content(src, dry=False):
+    """本地路径编码为 data URL；http(s) URL 直接使用。dry 模式不读文件。"""
+    if dry:
+        return {"type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,<DRY-RUN:{src}>"}}
+    if src.startswith("http://") or src.startswith("https://") or src.startswith("data:"):
+        return {"type": "image_url", "image_url": {"url": src}}
+
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"图片文件不存在: {src}")
+    ext = os.path.splitext(src)[1].lower()
+    if ext and ext not in SUPPORTED_EXT:
+        sys.stderr.write(f"[warn] 未识别的图片后缀 {ext}，仍尝试发送\n")
+    size = os.path.getsize(src)
+    if size > 20 * 1024 * 1024:
+        raise ValueError(f"图片过大 ({size} bytes > 20MB 上限)")
+
+    mime = mimetypes.guess_type(src)[0] or "image/png"
+    with open(src, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+
+def build_messages(prompt, images, system=None, dry=False):
+    content = [{"type": "text", "text": prompt}]
+    for src in images:
+        content.append(image_to_content(src, dry=dry))
+    user_msg = {"role": "user", "content": content}
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append(user_msg)
+    return messages
+
+
+# ----------------------------------------------------------------------------
+# 调用中转站
+# ----------------------------------------------------------------------------
+def call_relay(base_url, api_key, model, messages, timeout=180):
+    url = base_url + "/v1/chat/completions"
+    payload = {"model": model, "stream": False, "messages": messages}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {api_key}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:2000]
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"网络错误: {e.reason}")
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"返回非 JSON: {body[:2000]}")
+
+
+def extract_text(resp):
+    try:
+        return resp["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return json.dumps(resp, ensure_ascii=False, indent=2)
+
+
+def parse_json_object(text):
+    """尽量从模型输出中解析出 JSON（兼容 ```json 围栏 / 前后多余文字）。"""
+    if text is None:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t)
+        t = t.strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(t[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+def main():
+    funcs = load_functions()
+
+    ap = argparse.ArgumentParser(
+        description="通用视觉能力：通过 grsai 中转站调用 Gemini 多模态模型识别图片"
+                    "（OCR/描述/提取/感知/按字段提取），为非视觉模型提供眼睛。"
+    )
+    ap.add_argument("images", nargs="+", help="本地图片路径 或 http(s) 图片 URL，可多个")
+    ap.add_argument("--prompt", help="自定义提示词（覆盖模式默认提示）")
+    ap.add_argument(
+        "--mode",
+        choices=["ocr", "describe", "extract", "perceive"],
+        default="ocr",
+        help="预设模式：ocr=识别文字 / describe=描述内容 / extract=提取结构化 / "
+             "perceive=详细感知报告(面向非视觉模型)",
+    )
+    ap.add_argument("--keys", help="领域无关提取：逗号分隔的字段名，如 名称,材质,价格（返回 JSON）")
+    ap.add_argument(
+        "--function",
+        help="调用 functions.json 里自定义的功能（如 1）；默认无，需自建",
+    )
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"模型 (默认 {DEFAULT_MODEL})")
+    ap.add_argument("--hint", help="额外提示文本，追加到 keys/function 提示词")
+    ap.add_argument("--system", help="可选 system prompt")
+    ap.add_argument("--base-url", help="中转站 base url")
+    ap.add_argument("--json", action="store_true", help="以 JSON 输出原始响应")
+    ap.add_argument("--output", help="将结果写入该 JSON 文件路径（结构化模式）")
+    ap.add_argument("--per-image", action="store_true",
+                    help="结构化提取时每张图单独请求，结果聚合为 JSON 数组（适合批量）")
+    ap.add_argument("--timeout", type=int, default=180, help="请求超时秒数")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只构造并打印请求 payload，不真正发起网络请求（无需 API Key）")
+    args = ap.parse_args()
+
+    # 判定走哪条提取路径
+    func_key = args.function
+    keys = [k for k in (args.keys or "").split(",")] if args.keys else []
+    structured = bool(func_key) or bool(keys)  # 结构化输出（JSON）
+
+    base_url = (args.base_url or load_base_url()).rstrip("/")
+
+    # ---- 构造 prompt / system ----
+    if func_key is not None:
+        func = funcs.get(func_key)
+        if not func:
+            sys.stderr.write(
+                f"未找到功能 {func_key}。请在脚本同目录 functions.json 中定义它，"
+                "或改用 --keys 做领域无关提取。\n"
+            )
+            sys.exit(2)
+        prompt = args.prompt or build_function_prompt(func, extra=args.hint or "")
+        system = args.system if args.system else "你只输出 JSON 数据，不输出任何解释性文字。"
+    elif keys:
+        if len(keys) == 1 and not keys[0].strip():
+            sys.stderr.write("错误：--keys 至少需要一个字段名\n")
+            sys.exit(2)
+        prompt = args.prompt or build_keys_prompt(keys, extra=args.hint or "")
+        system = args.system if args.system else "你只输出 JSON 数据，不输出任何解释性文字。"
+    else:
+        prompt = args.prompt or DEFAULT_PROMPTS[args.mode]
+        system = args.system
+
+    # ---- dry-run ----
+    if args.dry_run:
+        if structured and args.per_image and len(args.images) > 1:
+            payloads = [
+                {"model": args.model, "stream": False,
+                 "messages": build_messages(prompt, [src], system, dry=True)}
+                for src in args.images
+            ]
+            safe = {"url": base_url + "/v1/chat/completions",
+                    "note": f"{len(payloads)} 个独立请求（--per-image）", "payloads": payloads}
+        else:
+            payload = {"model": args.model, "stream": False,
+                       "messages": build_messages(prompt, args.images, system, dry=True)}
+            safe = {"url": base_url + "/v1/chat/completions",
+                    "mode": f"function:{func_key}" if func_key else ("keys" if keys else args.mode),
+                    "payload": payload}
+        _redact(safe)
+        print(json.dumps(safe, ensure_ascii=False, indent=2))
+        return
+
+    api_key = load_api_key()
+    if not api_key:
+        sys.stderr.write(
+            "缺少 API Key。请设置环境变量 GRSAI_API_KEY，或在脚本同目录放 config.txt"
+            "（内容: GRSAI_API_KEY=你的key）。\n"
+        )
+        sys.exit(2)
+
+    try:
+        if structured and args.per_image and len(args.images) > 1:
+            results = []
+            for src in args.images:
+                msgs = build_messages(prompt, [src], system, dry=False)
+                resp = call_relay(base_url, api_key, args.model, msgs, timeout=args.timeout)
+                obj = parse_json_object(extract_text(resp))
+                if obj is None:
+                    obj = {"_raw": extract_text(resp)}
+                results.append(obj)
+            final = results
+        else:
+            msgs = build_messages(prompt, args.images, system, dry=False)
+            resp = call_relay(base_url, api_key, args.model, msgs, timeout=args.timeout)
+            if args.json:
+                print(json.dumps(resp, ensure_ascii=False, indent=2))
+                return
+            if structured:
+                obj = parse_json_object(extract_text(resp))
+                final = obj if obj is not None else {"_raw": extract_text(resp)}
+            else:
+                final = extract_text(resp)
+    except RuntimeError as e:
+        sys.stderr.write(f"调用失败: {e}\n")
+        sys.exit(1)
+
+    out = json.dumps(final, ensure_ascii=False, indent=2) if isinstance(final, (dict, list)) else str(final)
+    if args.output and isinstance(final, (dict, list)):
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(out + "\n")
+        sys.stderr.write(f"[ok] 已写入: {args.output}\n")
+    print(out)
+
+
+def _redact(safe):
+    """dry-run 输出中抹掉 data URL 的字节，避免打印超大内容。"""
+    node = safe.get("payload")
+    nodes = [node] if node else safe.get("payloads", [])
+    for p in nodes:
+        for m in p.get("messages", []):
+            if isinstance(m.get("content"), list):
+                for part in m["content"]:
+                    if part.get("type") == "image_url":
+                        u = part["image_url"]["url"]
+                        if u.startswith("data:") and "," in u:
+                            head, rest = u.split(",", 1)
+                            part["image_url"]["url"] = f"{head},<{len(rest)} bytes base64>"
+
+
+if __name__ == "__main__":
+    main()

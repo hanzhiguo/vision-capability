@@ -1,0 +1,7 @@
+# 真实凭证文件（含 grsai API Key），绝不提交/分发
+config.txt
+.grsai_key
+
+# Python 缓存
+__pycache__/
+*.pyc
